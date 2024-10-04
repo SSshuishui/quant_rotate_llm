@@ -1,7 +1,7 @@
 import torch
 import typing
 import transformers
-import utils
+from .utils import *
 import os
 import logging
 

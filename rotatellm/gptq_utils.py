@@ -3,8 +3,9 @@ import time
 import tqdm
 import torch
 import torch.nn as nn
-import utils
-import quant_utils
+
+from utils.utils import *
+from .quant_utils import *
 import logging
 
 torch.backends.cuda.matmul.allow_tf32 = False
@@ -206,7 +207,7 @@ def gptq_fwrd(model, dataloader, dev, args, logger):
         inps = inps.to(hf_device)
         position_ids = position_ids.to(hf_device)
 
-        full = quant_utils.find_qlayers(layer, layers=[torch.nn.Linear])
+        full = find_qlayers(layer, layers=[torch.nn.Linear])
         for names in sequential:
             subset = {n: full[n] for n in names}
 
@@ -221,7 +222,7 @@ def gptq_fwrd(model, dataloader, dev, args, logger):
                 if args.int8_down_proj and 'down_proj' in name:
                     layer_weight_bits = 8
                 gptq[name] = GPTQ(subset[name])
-                gptq[name].quantizer = quant_utils.WeightQuantizer()
+                gptq[name].quantizer = WeightQuantizer()
                 gptq[name].quantizer.configure(
                     layer_weight_bits, perchannel=True, sym=layer_weight_sym, mse=args.w_clip
                 )
@@ -260,7 +261,7 @@ def gptq_fwrd(model, dataloader, dev, args, logger):
         inps, outs = outs, inps
 
     model.config.use_cache = use_cache
-    utils.cleanup_memory(logger, verbos=True)
+    cleanup_memory(logger, verbos=True)
     logging.info('-----GPTQ Quantization Done-----\n')
     return quantizers
 
@@ -282,7 +283,7 @@ def rtn_fwrd(model, dev, args, logger):
     for i in tqdm.tqdm(range(len(layers)), desc="(RtN Quant.) Layers"):
         layer = layers[i].to(dev)
 
-        subset = quant_utils.find_qlayers(layer,
+        subset = find_qlayers(layer,
                                             layers=[torch.nn.Linear])
 
         for name in subset:
@@ -293,7 +294,7 @@ def rtn_fwrd(model, dev, args, logger):
             if args.int8_down_proj and 'down_proj' in name:
                 layer_weight_bits = 8
 
-            quantizer = quant_utils.WeightQuantizer()
+            quantizer = WeightQuantizer()
             quantizer.configure(
                 layer_weight_bits, perchannel=True, sym=not(args.w_asym), mse=args.w_clip
             )
@@ -306,5 +307,5 @@ def rtn_fwrd(model, dev, args, logger):
         torch.cuda.empty_cache()
         del layer
             
-    utils.cleanup_memory(logger, verbos=True)
+    cleanup_memory(logger, verbos=True)
     return quantizers

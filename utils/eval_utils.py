@@ -1,6 +1,6 @@
-import utils
-import model_utils
-import quant_utils
+from .utils import *
+from .model_utils import *
+from rotatellm.quant_utils import *
 import torch
 import os
 import logging

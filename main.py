@@ -1,47 +1,49 @@
 import os
-import utils
 import torch
-import model_utils
-import data_utils
 import transformers
-import quant_utils
-import rotation_utils
-import gptq_utils
-import eval_utils
-import hadamard_utils
+
+from rotatellm.quant_utils import *
+from rotatellm.rotation_utils import *
+from rotatellm.gptq_utils import *
+from utils.eval_utils import *
+from utils.hadamard_utils import *
+from utils.model_utils import *
+from utils.data_utils import *
+from utils.utils import *
+
 
 def main():
-    args, logger = utils.parser_gen()
+    args, logger = parser_gen()
     
     transformers.set_seed(args.seed)
-    model = model_utils.get_model(args.model, args.hf_token)
+    model = get_model(args.model, args.hf_token)
     model.eval()
     
     # Rotate the weights
     if args.rotate:
         logger.info("====== Rotate ======")
-        rotation_utils.fuse_layer_norms(model)
-        rotation_utils.rotate_model(model, args, logger)
-        utils.cleanup_memory(logger, verbos=True)
+        fuse_layer_norms(model)
+        rotate_model(model, args, logger)
+        cleanup_memory(logger, verbos=True)
             
-        quant_utils.add_actquant(model) #Add Activation Wrapper to the model
-        qlayers = quant_utils.find_qlayers(model)
+        add_actquant(model) #Add Activation Wrapper to the model
+        qlayers = find_qlayers(model)
         for name in qlayers:
             if 'down_proj' in name:
-                had_K, K = hadamard_utils.get_hadK(model.config.intermediate_size)
+                had_K, K = get_hadK(model.config.intermediate_size)
                 qlayers[name].online_full_had = True
                 qlayers[name].had_K = had_K
                 qlayers[name].K = K
                 qlayers[name].fp32_had = args.fp32_had
             if 'o_proj' in name:
-                had_K, K = hadamard_utils.get_hadK(model.config.num_attention_heads)
+                had_K, K = get_hadK(model.config.num_attention_heads)
                 qlayers[name].online_partial_had = True
                 qlayers[name].had_K = had_K
                 qlayers[name].K = K
                 qlayers[name].had_dim = model.config.hidden_size//model.config.num_attention_heads
                 qlayers[name].fp32_had = args.fp32_had
     else:
-        quant_utils.add_actquant(model) #Add Activation Wrapper to the model as the rest of the code assumes it is present
+        add_actquant(model) #Add Activation Wrapper to the model as the rest of the code assumes it is present
         
 
     if args.w_bits < 16:
@@ -63,16 +65,16 @@ def main():
             logger.info("===== GPTQ Weight Quantization =====")
             assert "llama" in args.model, "Only llama is supported for GPTQ!"
             
-            trainloader = data_utils.get_loaders(
+            trainloader = get_loaders(
                 args.cal_dataset, nsamples=args.nsamples,
                 seed=args.seed, model=args.model,
                 seqlen=model.seqlen, eval_mode=False
             )
-            quantizers = gptq_utils.gptq_fwrd(model, trainloader, utils.DEV, args, logger)
+            quantizers = gptq_fwrd(model, trainloader, DEV, args, logger)
             save_dict["w_quantizers"] = quantizers
         else: # RTN Weight Quantization
             logger.info("===== RTN Weight Quantization =====")
-            quantizers = gptq_utils.rtn_fwrd(model, utils.DEV, args)
+            quantizers = rtn_fwrd(model, DEV, args)
             save_dict["w_quantizers"] = quantizers
             
         if args.save_qmodel_path:
@@ -91,10 +93,10 @@ def main():
     if args.a_bits < 16 or args.v_bits < 16:
         logger.info("===== Start Quantization =====")
 
-        qlayers = quant_utils.find_qlayers(model, layers=[quant_utils.ActQuantWrapper])
+        qlayers = find_qlayers(model, layers=[ActQuantWrapper])
         down_proj_groupsize = -1
         if args.a_groupsize > 0 and "llama" in args.model:
-            down_proj_groupsize = utils.llama_down_proj_groupsize(model, args.a_groupsize, logger)
+            down_proj_groupsize = llama_down_proj_groupsize(model, args.a_groupsize, logger)
         
         for name in qlayers:            
             layer_input_bits = args.a_bits
@@ -115,7 +117,6 @@ def main():
                 if args.int8_down_proj:
                     layer_input_bits = 8
                 layer_groupsize = down_proj_groupsize
-
                 
             qlayers[name].quantizer.configure(bits=layer_input_bits,
                                               groupsize=layer_groupsize,
@@ -127,19 +128,19 @@ def main():
         if args.k_pre_rope:
             raise NotImplementedError("Pre-RoPE quantization is not supported yet!")
         else:
-            rope_function_name = model_utils.get_rope_function_name(model)  # apply_rotary_pos_emb
-            layers = model_utils.get_layers(model)
+            rope_function_name = get_rope_function_name(model)  # apply_rotary_pos_emb
+            layers = get_layers(model)
             k_quant_config = {'k_bits':args.k_bits, "k_groupsize": args.k_groupsize,
                                 "k_sym": not(args.k_asym), "k_clip_ratio": args.k_clip_ratio}
             for layer in layers:
-                rotation_utils.add_qk_rotation_wrapper_after_function_call_in_forward(
+                add_qk_rotation_wrapper_after_function_call_in_forward(
                             layer.self_attn, 
                             rope_function_name, 
                             config=model.config,
                             **k_quant_config)
         
     # Evaluating on dataset
-    testloader = data_utils.get_loaders(
+    testloader = get_loaders(
             args.eval_dataset,
             seed=args.seed,
             model=args.model,
@@ -149,7 +150,7 @@ def main():
         )
 
     
-    dataset_ppl = eval_utils.evaluator(model, testloader, utils.DEV, args)
+    dataset_ppl = evaluator(model, testloader, DEV, args)
 
     if not args.lm_eval:
         return
@@ -162,9 +163,9 @@ def main():
 
     
     if args.distribute:
-        utils.distribute_model(model)
+        distribute_model(model)
     else:
-        model.to(utils.DEV)
+        model.to(DEV)
     
     tokenizer = transformers.AutoTokenizer.from_pretrained(args.model, use_fast=False, use_auth_token=args.hf_token)
     hflm = HFLM(pretrained=model, tokenizer=tokenizer, batch_size=args.lm_eval_batch_size)
@@ -175,9 +176,6 @@ def main():
     metric_vals = {task: round(result.get('acc_norm,none', result['acc,none']), 4) for task, result in results.items()}
     metric_vals['acc_avg'] = round(sum(metric_vals.values()) / len(metric_vals.values()), 4)
     print(metric_vals)
-
-    
-
 
 if __name__ == '__main__':
     main()

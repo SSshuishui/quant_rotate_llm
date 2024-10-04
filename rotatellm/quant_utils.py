@@ -1,8 +1,8 @@
 import math
 import transformers
 import torch
-import utils
-import hadamard_utils
+from utils.utils import *
+from utils.hadamard_utils import *
 import fast_hadamard_transform
 
 def get_minq_maxq(bits, sym):
@@ -152,7 +152,7 @@ class ActQuantizer(torch.nn.Module):
         if self.groupsize > 0:
             # group-wise per-token quantization
             self.find_params_per_token_groupwise(x)
-            utils.cleanup_memory(verbos=False)
+            cleanup_memory(verbos=False)
             return
 
         reshaped_x = x.reshape((-1, x.shape[-1]))
@@ -221,9 +221,9 @@ class ActQuantWrapper(torch.nn.Module):
         if self.online_full_had:
             
             if self.fp32_had: # Full Hadamard in FP32
-                x = hadamard_utils.matmul_hadU_cuda(x.float(), self.had_K, self.K).to(x_dtype)
+                x = matmul_hadU_cuda(x.float(), self.had_K, self.K).to(x_dtype)
             else: # Full Hadamard in FP16
-                x = hadamard_utils.matmul_hadU_cuda(x, self.had_K, self.K)
+                x = matmul_hadU_cuda(x, self.had_K, self.K)
             
         elif self.online_partial_had:
             # todo: implement this in QAttention to avoid reshaping!
