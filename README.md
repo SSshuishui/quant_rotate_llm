@@ -33,6 +33,18 @@ Currently, we only support **LLaMa-2** models. You can simply run the `main.py` 
   
 For example, to run the perplexity of `LLaMA2-7B` model with quantizing all weights and activations, you can run the following command:
 
-```bash
-python main.py --model /data/BaseLLMs/llama2-7b-hf  --rotate --a_bits 4 --v_bits 4 --k_bits 4 --w_bits 4 --w_clip
+For QuaRot
+```
+python main.py \
+--methods quarot \
+--model /data/BaseLLMs/llama2-7b-hf \
+--rotate --a_bits 4 --v_bits 4 --k_bits 4 --w_bits 4 --w_clip
+```
+
+For SpinQuant
+```
+python main.py \
+--methods spinquant \
+--model /data/BaseLLMs/llama2-7b-hf \
+--rotate --a_bits 4 --v_bits 4 --k_bits 4 --w_bits 4 --w_clip
 ```

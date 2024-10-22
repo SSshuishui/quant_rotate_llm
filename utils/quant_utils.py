@@ -1,9 +1,41 @@
 import math
-import transformers
+
 import torch
-from utils.utils import *
-from utils.hadamard_utils import *
-import fast_hadamard_transform
+import transformers
+
+from train_utils.quant_linear import QuantizeLinear
+from utils import hadamard_utils
+from utils.utils import HadamardTransform
+import bitsandbytes as bnb
+
+
+def replace_linear_with_4bit_linear(model):
+    # Collect the modules to be replaced
+    modules_to_replace = []
+    for name, module in model.named_modules():
+        if isinstance(module, torch.nn.Linear):
+            modules_to_replace.append((name, module))
+
+    # Perform the replacement
+    for name, module in modules_to_replace:
+        quantized_linear = bnb.nn.Linear4bit(
+            module.in_features,
+            module.out_features,
+            bias=module.bias is not None,
+            quant_type = "nf4"
+        )
+        quantized_linear.weight.data = module.weight.data
+        if module.bias is not None:
+            quantized_linear.bias.data = module.bias.data
+
+        # Replace the original Linear layer
+        parent_module = model
+        name_parts = name.split('.')
+        for part in name_parts[:-1]:
+            parent_module = getattr(parent_module, part)
+        setattr(parent_module, name_parts[-1], quantized_linear)
+    
+    return model
 
 def get_minq_maxq(bits, sym):
     if sym:
@@ -38,44 +70,31 @@ def sym_quant_dequant(x, scale, maxq):
     return sym_dequant(*sym_quant(x, scale, maxq))
 
 
-def two_compl(x, bits: int):
-    return torch.where(x < 0, 2 ** bits + x, x)
+class STEQuantize(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x, scale, maxq):
+        scale = scale.to(x.device)
+        q = torch.clamp(torch.round(x / scale), -(maxq + 1), maxq)
+        return scale * q
 
-# Pack the int tensor. Each uint8 stores two int4 value.
-def pack_i4(q):
-    assert torch.is_signed(q), 'The tensor to be packed should be signed int'
-    minq, maxq = get_minq_maxq(4, True)
-    assert torch.all(torch.logical_and(q >= minq, q <= maxq))
-
-    q_i8 = two_compl(q.to(dtype=torch.int8), 4).to(torch.uint8)
-    q_i4 = q_i8[:, 0::2] | (q_i8[:, 1::2] << 4)
-    return q_i4
+    @staticmethod
+    def backward(ctx, grad_output):
+        # Straight-through estimator: just pass the gradient through
+        return grad_output, None, None
 
 
-# Unpack the quantized int4 tensor (stored in uint8) into int32 tensor.
-def unpack_i4(x: torch.Tensor):
-    assert x.dtype == torch.uint8, 'The tensor to be unpacked should be stored in uint8'
+class AsymSTEQuantize(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x, scale, zero, maxq):
+        scale = scale.to(x.device)
+        zero = zero.to(x.device)
+        q = torch.clamp(torch.round(x / scale) + zero, 0, maxq)
+        return scale * (q - zero)
 
-    out_shape = list(x.shape)
-    out_shape[-1] *= 2  # Each uint8 packs two numbers
+    @staticmethod
+    def backward(ctx, grad_output):
+        return grad_output, None, None, None
 
-    # Low 4 bits
-    x0 = (x & 0x0f).to(torch.int8)
-    x0[x0>=8] -= 16
-    x0 = x0.view(-1, x0.shape[-1])
-
-    # High 4 bits
-    x1 = ((x & 0xf0) >> 4).to(torch.int8)
-    x1[x1>=8] -= 16
-    x1 = x1.view(-1, x1.shape[-1])
-
-    out = torch.empty(out_shape, device=x.device, dtype=torch.int32)
-    out = out.view(-1, out.shape[-1])
-    # Interleaving
-    out[:, 0::2] = x0
-    out[:, 1::2] = x1
-
-    return out.view(out_shape)
 
 class ActQuantizer(torch.nn.Module):
 
@@ -195,6 +214,8 @@ class ActQuantWrapper(torch.nn.Module):
         self.bias = module.bias
         self.quantizer = ActQuantizer()
         self.out_quantizer = ActQuantizer()
+
+        # For online rotation operation
         self.register_buffer('had_K', torch.tensor(0))
         self._buffers['had_K'] = None
         self.K = 1
@@ -233,11 +254,20 @@ class ActQuantWrapper(torch.nn.Module):
                 
             init_shape = x.shape
             if self.K == 1:
-                x = fast_hadamard_transform.hadamard_transform(x.reshape(-1, init_shape[-1]//self.had_dim, self.had_dim).transpose(1, 2),
-                                                               scale=1/math.sqrt(init_shape[-1]//self.had_dim)).transpose(1, 2)
+                x = (
+                    HadamardTransform.apply(
+                        x.reshape(
+                            -1, init_shape[-1] // self.had_dim, self.had_dim
+                        ).transpose(1, 2)
+                    )
+                    / math.sqrt(init_shape[-1] // self.had_dim)
+                ).transpose(1, 2)
             else:
-                x = (self.had_K.to(x.dtype) @ x.reshape(-1, init_shape[-1]//self.had_dim, self.had_dim)) / math.sqrt(init_shape[-1]//self.had_dim)
-                
+                x = (
+                    self.had_K.to(x.dtype)
+                    @ x.reshape(-1, init_shape[-1] // self.had_dim, self.had_dim)
+                ) / math.sqrt(init_shape[-1] // self.had_dim)
+    
             if self.fp32_had:
                 x = x.to(x_dtype)
             x = x.reshape(init_shape)
@@ -247,7 +277,10 @@ class ActQuantWrapper(torch.nn.Module):
             x = self.quantizer(x).to(x_dtype)
             self.quantizer.free()
 
-        x = self.module(x).to(x_dtype)
+        if R1 is not None:
+            x = self.module(x, R1, R2, transpose).to(x_dtype)
+        else:
+            x = self.module(x).to(x_dtype)
 
         if self.out_quantizer.bits < 16: #Quantize the output, if needed
             self.out_quantizer.find_params(x)
@@ -322,7 +355,6 @@ class WeightQuantizer(torch.nn.Module):
                     zero1 = torch.zeros_like(scale1)
                     q = sym_quant_dequant(x, scale1.unsqueeze(1), self.maxq)
                 else:
-
                     scale1 = (xmax1 - xmin1) / self.maxq
                     zero1 = torch.round(-xmin1 / scale1)
                     q = asym_quant_dequant(x, scale1.unsqueeze(1), zero1.unsqueeze(1), self.maxq)
@@ -337,7 +369,6 @@ class WeightQuantizer(torch.nn.Module):
                     self.scale[tmp] = scale1[tmp]
                     self.zero[tmp] = zero1[tmp]
         if not self.perchannel:
-
             tmp = shape[0]
             self.scale = self.scale.repeat(tmp)
             self.zero = self.zero.repeat(tmp)
@@ -364,6 +395,7 @@ class WeightQuantizer(torch.nn.Module):
 
 
 def add_actquant(module, name='', layers=[torch.nn.Linear,
+                                          QuantizeLinear,
                                           ActQuantWrapper,
                                           transformers.models.falcon.modeling_falcon.FalconLinear]):
     if isinstance(module, ActQuantWrapper):
@@ -396,7 +428,9 @@ def find_qlayers(module, layers=[torch.nn.Linear, ActQuantWrapper], name=''):
         return {name: module}
     res = {}
     for name1, child in module.named_children():
-        res.update(find_qlayers(
-            child, layers=layers, name=name + '.' + name1 if name != '' else name1
-        ))
+        res.update(
+            find_qlayers(
+                child, layers=layers, name=name + '.' + name1 if name != '' else name1
+            )
+        )
     return res

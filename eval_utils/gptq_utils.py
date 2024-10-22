@@ -4,8 +4,7 @@ import tqdm
 import torch
 import torch.nn as nn
 
-from utils.utils import *
-from .quant_utils import *
+from utils import utils, quant_utils
 import logging
 
 torch.backends.cuda.matmul.allow_tf32 = False
@@ -207,7 +206,7 @@ def gptq_fwrd(model, dataloader, dev, args, logger):
         inps = inps.to(hf_device)
         position_ids = position_ids.to(hf_device)
 
-        full = find_qlayers(layer, layers=[torch.nn.Linear])
+        full = quant_utils.find_qlayers(layer, layers=[torch.nn.Linear])
         for names in sequential:
             subset = {n: full[n] for n in names}
 
@@ -222,7 +221,7 @@ def gptq_fwrd(model, dataloader, dev, args, logger):
                 if args.int8_down_proj and 'down_proj' in name:
                     layer_weight_bits = 8
                 gptq[name] = GPTQ(subset[name])
-                gptq[name].quantizer = WeightQuantizer()
+                gptq[name].quantizer = quant_utils.WeightQuantizer()
                 gptq[name].quantizer.configure(
                     layer_weight_bits, perchannel=True, sym=layer_weight_sym, mse=args.w_clip
                 )
@@ -283,8 +282,7 @@ def rtn_fwrd(model, dev, args, logger):
     for i in tqdm.tqdm(range(len(layers)), desc="(RtN Quant.) Layers"):
         layer = layers[i].to(dev)
 
-        subset = find_qlayers(layer,
-                                            layers=[torch.nn.Linear])
+        subset = quant_utils.find_qlayers(layer, layers=[torch.nn.Linear])
 
         for name in subset:
             layer_weight_bits = args.w_bits
@@ -294,7 +292,7 @@ def rtn_fwrd(model, dev, args, logger):
             if args.int8_down_proj and 'down_proj' in name:
                 layer_weight_bits = 8
 
-            quantizer = WeightQuantizer()
+            quantizer = quant_utils.WeightQuantizer()
             quantizer.configure(
                 layer_weight_bits, perchannel=True, sym=not(args.w_asym), mse=args.w_clip
             )

@@ -89,6 +89,11 @@ def random_hadamard_matrix(size, device):
     Q = torch.diag(Q)
     return matmul_hadU(Q).to(device)
 
+def hadamard_matrix(size, device):
+    # See https://cornell-relaxml.github.io/quip-sharp/ , Section "Randomized Hadamard Transformation"
+    Q = torch.eye(size)
+    return matmul_hadU(Q).to(device)
+
 def matmul_hadU_cuda(X, hadK, K):
     n = X.shape[-1]
     if K == 1:
@@ -105,7 +110,7 @@ def matmul_hadUt_cuda(X, hadK, K):
     return matmul_hadU_cuda(X, hadK, K, transpose=True)
 
 
-def apply_exact_had_to_linear(module, had_dim=-1, output=False):
+def apply_exact_had_to_linear(module, had_dim=-1, output=False, R2=None):
     assert isinstance(module, torch.nn.Linear)
     in_features, out_features = module.in_features, module.out_features
     
@@ -126,20 +131,21 @@ def apply_exact_had_to_linear(module, had_dim=-1, output=False):
             had_K, K = get_hadK(in_features)
             W_ = matmul_hadU_cuda(W_, had_K, K)
     else:
-        # Apply Hadamard to the last had_dim chunks of the weights
+        hadK = hadamard_matrix(had_dim, "cuda").to(torch.float64)
+        if R2 is not None:
+            hadK = R2.to(torch.float64)
         if output:
             W_ = W_.t()
             transposed_shape = W_.shape
-            W_ = fast_hadamard_transform.hadamard_transform(
-                W_.reshape(-1, transposed_shape[-1]//had_dim, had_dim), 
-                scale=1/math.sqrt(had_dim)
-                ).reshape(transposed_shape).t()
+            temp = W_.reshape(-1, transposed_shape[-1] // had_dim, had_dim)
+            temp = temp.to(torch.float64) @ hadK
+            W_ = temp.reshape(transposed_shape).t()
         else:
-            raise NotImplementedError("Not implemented (or tested) yet!")
-            n = W_.shape[1]
-            W_ = hadamard_transform(W_.reshape(-1, n//had_dim, had_dim), scale=1/math.sqrt(had_dim)).reshape(init_shape)
+            init_shape = W_.shape
+            temp = W_.reshape(-1, init_shape[-1] // had_dim, had_dim)
+            temp = temp.to(torch.float64) @ hadK
+            W_ = temp.reshape(init_shape)
     module.weight.data = W_.to(device=dev, dtype=dtype)
-
 
 
 def is_pow2(n):
